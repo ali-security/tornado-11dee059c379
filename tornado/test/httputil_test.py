@@ -595,6 +595,90 @@ Foo: even
             with self.assertRaises(HTTPInputError):
                 headers.add(name, "bar")
 
+    def test_contains(self):
+        headers = HTTPHeaders()
+        headers.add("Set-Cookie", "a=b")
+        headers.add("Set-Cookie", "c=d")
+        # Membership tests are case-insensitive like the rest of the dict interface.
+        self.assertIn("Set-Cookie", headers)
+        self.assertIn("set-cookie", headers)
+        self.assertIn("SET-COOKIE", headers)
+        self.assertNotIn("Content-Type", headers)
+        # Keys that aren't strings can't be present (and don't raise).
+        non_string_key: object = 42
+        self.assertNotIn(non_string_key, headers)
+
+    def test_combined_value_cache(self):
+        headers = HTTPHeaders()
+        headers.add("Foo", "1")
+        # Reading the combined value may cache it, so every subsequent mutation
+        # must invalidate that cache.
+        self.assertEqual(headers["Foo"], "1")
+        headers.add("Foo", "2")
+        self.assertEqual(headers["Foo"], "1,2")
+        headers.add("Foo", "3")
+        self.assertEqual(headers["Foo"], "1,2,3")
+        self.assertEqual(headers.get_list("Foo"), ["1", "2", "3"])
+        # Assignment replaces all of the previous values.
+        headers["foo"] = "4"
+        self.assertEqual(headers["Foo"], "4")
+        self.assertEqual(headers.get_list("Foo"), ["4"])
+
+    def test_combined_value_cache_continuation(self):
+        headers = HTTPHeaders()
+        headers.parse_line("Foo: bar")
+        self.assertEqual(headers["Foo"], "bar")
+        # A folded continuation line extends a value that may already be cached.
+        headers.parse_line(" baz")
+        self.assertEqual(headers["Foo"], "bar baz")
+        self.assertEqual(headers.get_list("Foo"), ["bar baz"])
+
+    def test_delete_repeated_header(self):
+        # Deleting a header that has more than one value works whether or not
+        # the combined value has been read.
+        for read_first in (False, True):
+            headers = HTTPHeaders()
+            headers.add("Foo", "1")
+            headers.add("Foo", "2")
+            if read_first:
+                self.assertEqual(headers["Foo"], "1,2")
+            del headers["Foo"]
+            self.assertNotIn("Foo", headers)
+            self.assertEqual(headers.get_list("Foo"), [])
+            self.assertEqual(len(headers), 0)
+            with self.assertRaises(KeyError):
+                del headers["Foo"]
+
+    def test_linear_performance(self):
+        def f(n):
+            start = time.perf_counter()
+            headers = HTTPHeaders()
+            for i in range(n):
+                headers.add("X-Foo", "bar")
+            return time.perf_counter() - start
+
+        # This runs under 50ms on my laptop as of 2025-12-09.
+        d1 = f(10_000)
+        d2 = f(100_000)
+        if d2 / d1 > 20:
+            # d2 should be about 10x d1 but allow a wide margin for variability.
+            self.fail(f"HTTPHeaders.add() does not scale linearly: {d1=} vs {d2=}")
+
+    def test_linear_performance_parse(self):
+        # The same quadratic blowup was reachable from the network: a single
+        # request whose header block repeats one field name many times.
+        def f(n):
+            data = "X-Foo: bar\r\n" * n
+            start = time.perf_counter()
+            HTTPHeaders.parse(data)
+            return time.perf_counter() - start
+
+        d1 = f(5_000)
+        d2 = f(50_000)
+        if d2 / d1 > 20:
+            # d2 should be about 10x d1 but allow a wide margin for variability.
+            self.fail(f"HTTPHeaders.parse() does not scale linearly: {d1=} vs {d2=}")
+
 
 class FormatTimestampTest(unittest.TestCase):
     # Make sure that all the input types are supported.
