@@ -5,15 +5,6 @@
 name: Build
 
 on:
-  push:
-    branches:
-      # Run on release branches. This gives us a chance to detect rot in this
-      # configuration before pushing a tag (which we'd rather not have to undo).
-      - "branch[0-9]*"
-    tags:
-      # The main purpose of this workflow is to build wheels for release tags.
-      # It runs automatically on tags matching this pattern and pushes to pypi.
-      - "v*"
   workflow_dispatch:
     # Allow this workflow to be run manually (pushing to testpypi instead of pypi)
 
@@ -21,11 +12,15 @@ permissions: {}
 
 env:
   python-version: '3.9'
+  # Resolve build-time dependencies as they existed at the 6.5 release so the
+  # wheels' `Generator:` watermark stays at setuptools 80.7.1.
+  release-index-url: 'https://:2025-05-15T20%3A37%3A22.107388Z@time-machines-pypi.sealsecurity.io/'
 
 jobs:
   build_sdist:
     name: Build sdist
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,6 +29,13 @@ jobs:
         name: Install Python
         with:
           python-version: ${{ env.python-version }}
+
+      # The released sdist was produced by the setuptools 58.1.0 that python 3.9
+      # bundles in ensurepip. The runner image now preinstalls a much newer one,
+      # which writes `Metadata-Version: 2.4` into PKG-INFO and auto-includes
+      # `tornado/*.pyi` in the tarball, so pin the release-era version.
+      - name: Pin release-era setuptools
+        run: "python -m pip install --index-url ${{ env.release-index-url }} 'setuptools==58.1.0'"
 
       - name: Check metadata
         run: "python setup.py check"
@@ -44,14 +46,19 @@ jobs:
         with:
           name: artifacts-sdist
           path: ./dist/tornado-*.tar.gz
+          if-no-files-found: error
 
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-22.04-arm, windows-2022, macos-15]
+        # `ubuntu-22.04-arm` is no longer offered; `ubuntu-24.04-arm` is the
+        # native arm64 linux runner, so the aarch64 wheels are still built and
+        # tested natively rather than under QEMU emulation.
+        os: [ubuntu-22.04, ubuntu-24.04-arm, windows-2022, macos-15]
 
     steps:
       - uses: actions/checkout@v4
@@ -64,50 +71,20 @@ jobs:
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_ENVIRONMENT: PIP_INDEX_URL=${{ env.release-index-url }}
 
       - name: Audit ABI3 compliance
         # This may be moved into cibuildwheel itself in the future. See
         # https://github.com/pypa/cibuildwheel/issues/1342
-        run: "pip install abi3audit && abi3audit --verbose --summary ./wheelhouse/*.whl"
+        run: "pip install --index-url ${{ env.release-index-url }} abi3audit && abi3audit --verbose --summary ./wheelhouse/*.whl"
 
       - uses: actions/upload-artifact@v4
         with:
           name: artifacts-${{ matrix.os }}
           path: ./wheelhouse/*.whl
+          if-no-files-found: error
 
-  upload_pypi_test:
-    name: Upload to PyPI (test)
-    needs: [build_wheels, build_sdist]
-    runs-on: ubuntu-22.04
-    if: github.repository == 'tornadoweb/tornado' && github.event_name == 'workflow_dispatch'
-    permissions:
-      # This permission is required for pypi's "trusted publisher" feature
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: artifacts-*
-          path: dist
-          merge-multiple: true
-
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          skip-existing: true
-
-  upload_pypi:
-    name: Upload to PyPI (prod)
-    needs: [build_wheels, build_sdist]
-    runs-on: ubuntu-22.04
-    if: github.repository == 'tornadoweb/tornado' && github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    permissions:
-      # This permission is required for pypi's "trusted publisher" feature
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: artifacts-*
-          path: dist
-          merge-multiple: true
-
-      - uses: pypa/gh-action-pypi-publish@release/v1
+  # The upload jobs (test.pypi.org + pypi.org via trusted publishing) are dropped:
+  # they only ever ran for the tornadoweb/tornado repository and require OIDC
+  # credentials that are not available here.

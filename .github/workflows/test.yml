@@ -7,7 +7,13 @@
 
 name: Test
 
-on: pull_request
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional test selector; empty runs the full suite"
+        required: false
+        default: ""
 
 permissions: {}
 
@@ -18,6 +24,7 @@ jobs:
   test_quick:
     name: Run quick tests
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,13 +38,29 @@ jobs:
         run: python -m pip install tox -c requirements.txt
 
       - name: Run test suite
-        run: python -m tox -e py311,lint
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            python -m tox -e py311 -- $TEST_FILTER
+          else
+            python -m tox -e py311,lint
+          fi
 
   test_tox:
     name: Run full tests
     needs: test_quick
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    # The `-full` tox envs install pycurl/twisted/pycares unpinned. A current
+    # pycares no longer exposes `Channel.gethostbyname`, which breaks
+    # tornado.platform.caresresolver and fails every `-full` leg, so resolve
+    # the test dependencies as they existed at the 6.5 release. tox forwards
+    # `PIP_*` to its test envs by default.
+    env:
+      PIP_INDEX_URL: 'https://:2025-05-15T20%3A37%3A22.107388Z@time-machines-pypi.sealsecurity.io/'
     strategy:
+      fail-fast: false
       matrix:
         include:
           - python: '3.9'
@@ -81,7 +104,14 @@ jobs:
         run: python -m pip install tox -c requirements.txt
 
       - name: Run test suite
-        run: python -m tox -e ${{ matrix.tox_env }}
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            python -m tox -e ${{ matrix.tox_env }} -- $TEST_FILTER
+          else
+            python -m tox -e ${{ matrix.tox_env }}
+          fi
 
   test_win:
     # Windows tests are fairly slow, so only run one configuration here.
@@ -92,6 +122,7 @@ jobs:
     name: Run windows tests
     needs: test_quick
     runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,12 +133,21 @@ jobs:
           python-version: '3.11'
       - name: Run test suite
         # TODO: figure out what's up with these log messages
-        run: py -m tornado.test --fail-if-logs=false
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            py -m tornado.test --fail-if-logs=false $TEST_FILTER
+          else
+            py -m tornado.test --fail-if-logs=false
+          fi
 
   zizmor:
     name: Analyze action configs with zizmor
     runs-on: ubuntu-22.04
     needs: test_quick
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -115,6 +155,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         name: Install uv
       - name: Run zizmor
+        # Resolve zizmor as of the 6.5 release so a newer release's added rules
+        # don't retroactively fail this configuration.
+        env:
+          UV_INDEX_URL: 'https://:2025-05-15T20%3A37%3A22.107388Z@time-machines-pypi.sealsecurity.io/'
         run: uvx zizmor .github/workflows
 
   test_cibw:
@@ -129,6 +173,7 @@ jobs:
     name: Test with cibuildwheel
     runs-on: ubuntu-22.04
     needs: test_quick
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
