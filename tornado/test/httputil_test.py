@@ -1,5 +1,6 @@
 from tornado.httputil import (
     url_concat,
+    parse_body_arguments,
     parse_multipart_form_data,
     HTTPHeaders,
     format_timestamp,
@@ -9,6 +10,9 @@ from tornado.httputil import (
     qs_to_qsl,
     HTTPInputError,
     HTTPFile,
+    ParseBodyConfig,
+    ParseMultipartConfig,
+    set_parse_body_config,
 )
 from tornado.escape import utf8, native_str
 from tornado.log import gen_log
@@ -261,6 +265,143 @@ Foo
         file = files["files"][0]
         self.assertEqual(file["filename"], "ab.txt")
         self.assertEqual(file["body"], b"Foo")
+
+    def test_multipart_config(self):
+        boundary = b"1234"
+        body = b"""--1234
+Content-Disposition: form-data; name="files"; filename="ab.txt"
+
+--1234--""".replace(
+            b"\n", b"\r\n"
+        )
+        config = ParseMultipartConfig()
+        args, files = form_data_args()
+        parse_multipart_form_data(boundary, body, args, files, config=config)
+        self.assertEqual(files["files"][0]["filename"], "ab.txt")
+
+        config_no_parts = ParseMultipartConfig(max_parts=0)
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(
+                boundary, body, args, files, config=config_no_parts
+            )
+        self.assertIn("too many parts", str(cm.exception))
+
+        config_small_headers = ParseMultipartConfig(max_part_header_size=10)
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(
+                boundary, body, args, files, config=config_small_headers
+            )
+        self.assertIn("header too large", str(cm.exception))
+
+        config_disabled = ParseMultipartConfig(enabled=False)
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(
+                boundary, body, args, files, config=config_disabled
+            )
+        self.assertIn("multipart/form-data parsing is disabled", str(cm.exception))
+
+    def test_default_max_parts(self):
+        # A body with a very large number of parts is expensive to parse and
+        # blocks the event loop while it happens. The default configuration
+        # rejects such bodies even when no explicit config is passed.
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        # The leading empty string produced by the split counts as a part, so
+        # 100 repetitions is one over the default limit of 100.
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(
+                b"1234",
+                part * 100 + b"--1234--\r\n",
+                args,
+                files,
+            )
+        self.assertIn("too many parts", str(cm.exception))
+        self.assertEqual(args, {})
+
+        # A body within the limit is still parsed normally.
+        args, files = form_data_args()
+        parse_multipart_form_data(b"1234", part * 99 + b"--1234--\r\n", args, files)
+        self.assertEqual(len(args["a"]), 99)
+
+    def test_default_max_part_header_size(self):
+        # A single part whose headers are enormous is also expensive to parse.
+        long_filename = b"x" * (10 * 1024 + 1)
+        data = (
+            b'--1234\r\nContent-Disposition: form-data; name="files"; filename="'
+            + long_filename
+            + b'"\r\n\r\nFoo\r\n--1234--\r\n'
+        )
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_multipart_form_data(b"1234", data, args, files)
+        self.assertIn("header too large", str(cm.exception))
+        self.assertEqual(files, {})
+
+    def test_parse_body_arguments_multipart_limits(self):
+        # The limits also apply to bodies dispatched through
+        # parse_body_arguments, which is the path taken by HTTP requests.
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        content_type = "multipart/form-data; boundary=1234"
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_body_arguments(
+                content_type,
+                part * 100 + b"--1234--\r\n",
+                args,
+                files,
+            )
+        self.assertIn("too many parts", str(cm.exception))
+        self.assertEqual(args, {})
+
+        args, files = form_data_args()
+        parse_body_arguments(content_type, part * 99 + b"--1234--\r\n", args, files)
+        self.assertEqual(len(args["a"]), 99)
+
+    def test_parse_body_arguments_invalid_content_type(self):
+        # A content type that merely starts with "multipart/form-data" must
+        # not be parsed as multipart.
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_body_arguments(
+                "multipart/form-dataxyz; boundary=1234",
+                part + b"--1234--\r\n",
+                args,
+                files,
+            )
+        self.assertIn("Invalid content type", str(cm.exception))
+        self.assertEqual(args, {})
+
+    def test_set_parse_body_config(self):
+        part = b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nb\r\n'
+        body = part + b"--1234--\r\n"
+        content_type = "multipart/form-data; boundary=1234"
+
+        args, files = form_data_args()
+        parse_body_arguments(content_type, body, args, files)
+        self.assertEqual(args["a"], [b"b"])
+
+        set_parse_body_config(
+            ParseBodyConfig(multipart=ParseMultipartConfig(enabled=False))
+        )
+        try:
+            args, files = form_data_args()
+            with self.assertRaises(HTTPInputError) as cm:
+                parse_body_arguments(content_type, body, args, files)
+            self.assertIn("parsing is disabled", str(cm.exception))
+            self.assertEqual(args, {})
+
+            # The global default also applies to parse_multipart_form_data.
+            args, files = form_data_args()
+            with self.assertRaises(HTTPInputError) as cm:
+                parse_multipart_form_data(b"1234", body, args, files)
+            self.assertIn("parsing is disabled", str(cm.exception))
+        finally:
+            set_parse_body_config(ParseBodyConfig())
+
+        args, files = form_data_args()
+        parse_body_arguments(content_type, body, args, files)
+        self.assertEqual(args["a"], [b"b"])
 
 
 class HTTPHeadersTest(unittest.TestCase):
